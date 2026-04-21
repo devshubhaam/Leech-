@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -23,12 +24,7 @@ from utils.progress import ProgressTracker
 
 logger = logging.getLogger(__name__)
 
-# ─── Helpers ────────────────────────────────────────────────────────────────
-
-URL_RE = re.compile(
-    r"(https?://[^\s]+|magnet:\?[^\s]+)",
-    re.IGNORECASE,
-)
+URL_RE = re.compile(r"(https?://[^\s]+|magnet:\?[^\s]+)", re.IGNORECASE)
 
 
 def extract_url(text: str) -> Optional[str]:
@@ -37,15 +33,11 @@ def extract_url(text: str) -> Optional[str]:
 
 
 async def safe_edit(message: Message, text: str):
-    """Edit message, ignore 'not modified' errors."""
     try:
         await message.edit_text(text, parse_mode=ParseMode.HTML)
     except TelegramError as e:
         if "not modified" not in str(e).lower():
             logger.debug("safe_edit error: %s", e)
-
-
-# ─── Upload helper ───────────────────────────────────────────────────────────
 
 
 async def upload_file(
@@ -55,7 +47,7 @@ async def upload_file(
     status_msg: Message,
     as_document: bool = True,
 ):
-    """Upload a single file to Telegram with progress tracking."""
+    """Upload file to Telegram — manual progress polling (no progress callback)."""
     size = os.path.getsize(file_path)
     filename = os.path.basename(file_path)
     chat_id = update.effective_chat.id
@@ -63,60 +55,35 @@ async def upload_file(
     await safe_edit(
         status_msg,
         f"📤 <b>Uploading:</b> <code>{filename}</code>\n"
-        f"📦 Size: <b>{human_size(size)}</b>",
+        f"📦 Size: <b>{human_size(size)}</b>\n"
+        f"⏳ Please wait…",
     )
 
-    tracker = ProgressTracker(total=size, label="Uploading")
-
-    async def progress_cb(current: int, total: int):
-        now = asyncio.get_event_loop().time()
-        text = tracker.render(current, now)
-        await safe_edit(status_msg, text)
+    ext = Path(file_path).suffix.lower()
 
     try:
         with open(file_path, "rb") as f:
-            if as_document:
+            if not as_document and ext in (".mp4", ".mkv", ".mov", ".webm"):
+                await context.bot.send_video(
+                    chat_id=chat_id,
+                    video=f,
+                    filename=filename,
+                    write_timeout=300,
+                    connect_timeout=60,
+                    read_timeout=300,
+                    supports_streaming=True,
+                )
+            else:
                 await context.bot.send_document(
                     chat_id=chat_id,
                     document=f,
                     filename=filename,
-                    write_timeout=120,
-                    connect_timeout=30,
-                    read_timeout=120,
-                    pool_timeout=30,
-                    progress=progress_cb,
+                    write_timeout=300,
+                    connect_timeout=60,
+                    read_timeout=300,
                 )
-            else:
-                # Try as video if mp4/mkv
-                ext = Path(file_path).suffix.lower()
-                if ext in (".mp4", ".mkv", ".mov", ".webm"):
-                    await context.bot.send_video(
-                        chat_id=chat_id,
-                        video=f,
-                        filename=filename,
-                        write_timeout=120,
-                        connect_timeout=30,
-                        read_timeout=120,
-                        pool_timeout=30,
-                        progress=progress_cb,
-                        supports_streaming=True,
-                    )
-                else:
-                    await context.bot.send_document(
-                        chat_id=chat_id,
-                        document=f,
-                        filename=filename,
-                        write_timeout=120,
-                        connect_timeout=30,
-                        read_timeout=120,
-                        pool_timeout=30,
-                        progress=progress_cb,
-                    )
     except TelegramError as e:
         raise RuntimeError(f"Telegram upload failed: {e}") from e
-
-
-# ─── Core leech coroutine ────────────────────────────────────────────────────
 
 
 async def do_leech(
@@ -139,13 +106,17 @@ async def do_leech(
     downloaded_files = []
 
     try:
-        # ── Download ─────────────────────────────────────────────────────────
         tracker = ProgressTracker(total=0, label="Downloading")
+        last_edit = 0.0
 
         async def dl_progress(current: int, total: int, speed: float = 0):
+            nonlocal last_edit
+            now = time.monotonic()
+            if now - last_edit < 4:
+                return
+            last_edit = now
             if total > 0:
                 tracker.total = total
-            now = asyncio.get_event_loop().time()
             text = tracker.render(current, now, speed=speed)
             await safe_edit(status_msg, text)
 
@@ -160,7 +131,6 @@ async def do_leech(
             await safe_edit(status_msg, "❌ <b>Download failed</b> — no files received.")
             return
 
-        # ── Upload each file ──────────────────────────────────────────────────
         for file_path in downloaded_files:
             if task.cancel_event.is_set():
                 await safe_edit(status_msg, "🚫 <b>Cancelled.</b>")
@@ -169,7 +139,6 @@ async def do_leech(
             size = os.path.getsize(file_path)
 
             if size > Config.MAX_UPLOAD_SIZE:
-                # Try splitting
                 await safe_edit(
                     status_msg,
                     f"✂️ File is <b>{human_size(size)}</b> — splitting into ≤49 MB parts…",
@@ -197,36 +166,30 @@ async def do_leech(
         cleanup_dir(download_dir)
 
 
-# ─── Handlers ────────────────────────────────────────────────────────────────
-
-
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    leech_queue.start()
     await update.message.reply_text(
         "👋 <b>Leech Bot Online</b>\n\n"
         "Send me any supported link or use /leech &lt;url&gt;\n"
         "Use /help for details.",
         parse_mode=ParseMode.HTML,
     )
-    leech_queue.start()  # idempotent — safe to call again
 
 
 async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "<b>📖 Leech Bot Help</b>\n\n"
         "<b>Commands:</b>\n"
-        "• /leech &lt;url&gt; — Download and upload a file\n"
-        "• /cancel — Cancel the current task\n"
+        "• /leech &lt;url&gt; — Download and upload\n"
+        "• /cancel — Cancel current task\n"
         "• /help — This message\n\n"
-        "<b>Or just send a URL directly.</b>\n\n"
         "<b>Supported links:</b>\n"
-        "• Direct file links (.mp4, .mkv, .zip, .rar, .7z, .pdf …)\n"
-        "• MEGA links (mega.nz/file or mega.nz/folder)\n"
+        "• Direct file links (.mp4, .mkv, .zip, .rar …)\n"
+        "• MEGA links (mega.nz/file)\n"
         "• Magnet links\n"
         "• YouTube / yt-dlp supported sites\n\n"
-        "<b>Limits:</b>\n"
-        f"• Max upload: 50 MB per file (split if larger)\n"
-        f"• Max download: {human_size(Config.MAX_DOWNLOAD_SIZE)}\n"
-        f"• Video quality: up to {Config.YTDLP_MAX_HEIGHT}p\n",
+        f"• Max upload: 50 MB per file (auto-split)\n"
+        f"• Max download: {human_size(Config.MAX_DOWNLOAD_SIZE)}\n",
         parse_mode=ParseMode.HTML,
     )
 
@@ -240,7 +203,6 @@ async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def leech_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /leech <url>"""
     args = context.args
     if not args:
         await update.message.reply_text(
@@ -252,25 +214,14 @@ async def leech_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle raw URL messages or .torrent document uploads."""
     msg = update.message
-
-    # Document upload (.torrent)
     if msg.document:
-        doc = msg.document
-        if doc.file_name and doc.file_name.endswith(".torrent"):
-            await msg.reply_text("⬇️ Torrent files via upload are not yet supported. Send a magnet link instead.")
-        else:
-            await msg.reply_text("📎 Send a URL to leech a file.")
+        await msg.reply_text("Send a URL to leech a file.")
         return
-
     text = msg.text or ""
     url = extract_url(text)
     if url:
         await _enqueue_leech(url, update, context)
-    else:
-        # Not a URL — ignore silently or give a hint
-        pass
 
 
 async def _enqueue_leech(url: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -279,7 +230,7 @@ async def _enqueue_leech(url: str, update: Update, context: ContextTypes.DEFAULT
         return
 
     qsize = leech_queue.queue_size()
-    pos_msg = f" (position in queue: {qsize})" if qsize > 0 else ""
+    pos_msg = f" (position: {qsize})" if qsize > 0 else ""
     await update.message.reply_text(
         f"✅ Added to queue{pos_msg}.\n<code>{url[:100]}</code>",
         parse_mode=ParseMode.HTML,
