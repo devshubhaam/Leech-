@@ -1,5 +1,5 @@
 """
-Telegram handlers for all commands and messages.
+Telegram handlers - video mode default, no splitting for streaming videos
 """
 
 import asyncio
@@ -15,7 +15,7 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
-from bot.queue import leech_queue, TaskStatus
+from bot.queue import leech_queue
 from config import Config
 from downloader.dispatcher import detect_and_download
 from utils.cleanup import delete_file, cleanup_dir
@@ -25,6 +25,7 @@ from utils.progress import ProgressTracker
 logger = logging.getLogger(__name__)
 
 URL_RE = re.compile(r"(https?://[^\s]+|magnet:\?[^\s]+)", re.IGNORECASE)
+VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".flv", ".m4v", ".ts"}
 
 
 def extract_url(text: str) -> Optional[str]:
@@ -45,12 +46,12 @@ async def upload_file(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     status_msg: Message,
-    as_document: bool = True,
 ):
-    """Upload file to Telegram — manual progress polling (no progress callback)."""
     size = os.path.getsize(file_path)
     filename = os.path.basename(file_path)
     chat_id = update.effective_chat.id
+    ext = Path(file_path).suffix.lower()
+    is_video = ext in VIDEO_EXTS
 
     await safe_edit(
         status_msg,
@@ -59,40 +60,32 @@ async def upload_file(
         f"⏳ Please wait…",
     )
 
-    ext = Path(file_path).suffix.lower()
-
     try:
         with open(file_path, "rb") as f:
-            if not as_document and ext in (".mp4", ".mkv", ".mov", ".webm"):
+            if is_video:
                 await context.bot.send_video(
                     chat_id=chat_id,
                     video=f,
                     filename=filename,
-                    write_timeout=300,
-                    connect_timeout=60,
-                    read_timeout=300,
                     supports_streaming=True,
+                    write_timeout=600,
+                    connect_timeout=60,
+                    read_timeout=600,
                 )
             else:
                 await context.bot.send_document(
                     chat_id=chat_id,
                     document=f,
                     filename=filename,
-                    write_timeout=300,
+                    write_timeout=600,
                     connect_timeout=60,
-                    read_timeout=300,
+                    read_timeout=600,
                 )
     except TelegramError as e:
         raise RuntimeError(f"Telegram upload failed: {e}") from e
 
 
-async def do_leech(
-    url: str,
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    task,
-    as_document: bool = True,
-):
+async def do_leech(url, update, context, task):
     chat_id = update.effective_chat.id
     status_msg = await context.bot.send_message(
         chat_id=chat_id,
@@ -102,8 +95,6 @@ async def do_leech(
 
     download_dir = os.path.join(Config.DOWNLOAD_DIR, task.task_id)
     os.makedirs(download_dir, exist_ok=True)
-
-    downloaded_files = []
 
     try:
         tracker = ProgressTracker(total=0, label="Downloading")
@@ -117,8 +108,7 @@ async def do_leech(
             last_edit = now
             if total > 0:
                 tracker.total = total
-            text = tracker.render(current, now, speed=speed)
-            await safe_edit(status_msg, text)
+            await safe_edit(status_msg, tracker.render(current, now, speed=speed))
 
         downloaded_files = await detect_and_download(
             url=url,
@@ -137,18 +127,36 @@ async def do_leech(
                 return
 
             size = os.path.getsize(file_path)
+            ext = Path(file_path).suffix.lower()
+            is_video = ext in VIDEO_EXTS
 
             if size > Config.MAX_UPLOAD_SIZE:
-                await safe_edit(
-                    status_msg,
-                    f"✂️ File is <b>{human_size(size)}</b> — splitting into ≤49 MB parts…",
-                )
-                parts = await split_file(file_path, Config.SPLIT_SIZE)
-                for part in parts:
-                    await upload_file(part, update, context, status_msg, as_document)
-                    delete_file(part)
+                if is_video:
+                    # Video ke liye split mat karo — seedha bata do size limit
+                    await safe_edit(
+                        status_msg,
+                        f"⚠️ <b>File too large:</b> {human_size(size)}\n"
+                        f"Telegram limit 50 MB hai.\n"
+                        f"Try karo: /leech ke saath lower quality URL\n"
+                        f"Ya file split parts mein chahiye? /leech_split bhejo"
+                    )
+                    # Phir bhi try karo — Telegram sometimes accepts slightly over 50MB videos
+                    try:
+                        await upload_file(file_path, update, context, status_msg)
+                    except Exception:
+                        pass
+                else:
+                    # Non-video files split karo
+                    await safe_edit(
+                        status_msg,
+                        f"✂️ File is <b>{human_size(size)}</b> — splitting into parts…",
+                    )
+                    parts = await split_file(file_path, Config.SPLIT_SIZE)
+                    for part in parts:
+                        await upload_file(part, update, context, status_msg)
+                        delete_file(part)
             else:
-                await upload_file(file_path, update, context, status_msg, as_document)
+                await upload_file(file_path, update, context, status_msg)
 
             delete_file(file_path)
 
@@ -184,12 +192,12 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /cancel — Cancel current task\n"
         "• /help — This message\n\n"
         "<b>Supported links:</b>\n"
-        "• Direct file links (.mp4, .mkv, .zip, .rar …)\n"
-        "• MEGA links (mega.nz/file)\n"
+        "• Direct links (.mp4 .mkv .zip .rar …)\n"
+        "• MEGA links\n"
         "• Magnet links\n"
-        "• YouTube / yt-dlp supported sites\n\n"
-        f"• Max upload: 50 MB per file (auto-split)\n"
-        f"• Max download: {human_size(Config.MAX_DOWNLOAD_SIZE)}\n",
+        "• YouTube / 1000+ sites\n\n"
+        f"• Max: {human_size(Config.MAX_DOWNLOAD_SIZE)} download\n"
+        f"• Videos upload as video (streamable)\n",
         parse_mode=ParseMode.HTML,
     )
 
@@ -205,12 +213,9 @@ async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def leech_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text(
-            "Usage: /leech &lt;url&gt;", parse_mode=ParseMode.HTML
-        )
+        await update.message.reply_text("Usage: /leech &lt;url&gt;", parse_mode=ParseMode.HTML)
         return
-    url = args[0].strip()
-    await _enqueue_leech(url, update, context)
+    await _enqueue_leech(args[0].strip(), update, context)
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -218,8 +223,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.document:
         await msg.reply_text("Send a URL to leech a file.")
         return
-    text = msg.text or ""
-    url = extract_url(text)
+    url = extract_url(msg.text or "")
     if url:
         await _enqueue_leech(url, update, context)
 
