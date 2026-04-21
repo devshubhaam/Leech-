@@ -1,0 +1,24 @@
+services:
+  - type: worker
+    name: telegram-leech-bot
+    runtime: python
+    buildCommand: |
+      pip install -r requirements.txt
+      apt-get install -y aria2 ffmpeg 2>/dev/null || true
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: DOWNLOAD_DIR
+        value: /tmp/leech_downloads
+      - key: MAX_DOWNLOAD_SIZE
+        value: "419430400"
+      - key: YTDLP_MAX_HEIGHT
+        value: "720"
+      - key: MEGA_EMAIL
+        sync: false
+      - key: MEGA_PASSWORD
+        sync: false
+    plan: free
